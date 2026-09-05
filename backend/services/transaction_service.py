@@ -40,12 +40,19 @@ def compute_dashboard_metrics(db: Session) -> dict:
         .count()
     )
 
-    successful_recoveries = sum(1 for t in all_txns if t.recovery_status == "RECOVERED")
+    # Source of truth for "recovered" is a real RecoveryEvent with a
+    # recovered_amount, not just a transaction's recovery_status flag —
+    # a transaction can be marked RECOVERED because it simply succeeded
+    # on its own (never entered the recovery pipeline), and that should
+    # not be counted as a RECLAIM recovery. Dedupe by transaction so a
+    # transaction is only ever counted once even if it has multiple
+    # recovered events (shouldn't happen given idempotency, but be safe).
+    recovered_amount_by_txn = {}
+    for e in db.query(RecoveryEvent).filter(RecoveryEvent.recovered_amount > 0).all():
+        recovered_amount_by_txn[e.transaction_id] = e.recovered_amount
 
-    recovered_revenue = sum(
-        e.recovered_amount or 0
-        for e in db.query(RecoveryEvent).filter(RecoveryEvent.recovered_amount > 0).all()
-    )
+    successful_recoveries = len(recovered_amount_by_txn)
+    recovered_revenue = sum(recovered_amount_by_txn.values())
 
     return {
         "transactions_analyzed": transactions_analyzed,

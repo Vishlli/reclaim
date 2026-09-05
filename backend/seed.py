@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 
 from database import Base, engine, SessionLocal
 from models import Transaction, Policy, RecoveryEvent, ManualReview
+from engine.executor import make_idempotency_key, SIMULATED_TAG
 
 random.seed(42)
 
@@ -52,6 +53,7 @@ def _make_txn(ref, customer, amount, status, failure_code, failure_reason, attem
 
 def generate_transactions():
     txns = []
+    recovered_cohort = []  # transactions that were genuinely recovered via the recovery pipeline
     counter = 10000
 
     def next_ref():
@@ -114,12 +116,18 @@ def generate_transactions():
             1, random.randint(0, 2), "UNRESOLVED", created_offset_days=1,
         ))
 
-    # Cohort: Already recovered (10) — failed, then later succeeded
+    # Cohort: Already recovered (10) — failed, then later succeeded via a
+    # RECLAIM recovery action. These are the ONLY transactions that should
+    # count toward "Recovered Revenue" — track them separately so we can
+    # seed matching RecoveryEvent rows (the dashboard's actual source of
+    # truth for recovered revenue, see transaction_service.py).
     for _ in range(10):
-        txns.append(_make_txn(
+        txn = _make_txn(
             next_ref(), random.choice(customer_names), round(random.uniform(500, 8000), 2),
             "SUCCESS", None, "Recovered after retry", 2, random.randint(0, 4), "RECOVERED", created_offset_days=3,
-        ))
+        )
+        txns.append(txn)
+        recovered_cohort.append(txn)
 
     # Remaining to reach ~150: mixed transient/repeated filler
     remaining = 150 - len(txns)
@@ -140,7 +148,7 @@ def generate_transactions():
         "Transient failure, recovery action will fail on execution", 1, 1, "UNRESOLVED", created_offset_days=0,
     ))
 
-    return txns
+    return txns, recovered_cohort
 
 
 def seed():
@@ -166,12 +174,40 @@ def seed():
         )
         db.add(default_policy)
 
-        for txn in generate_transactions():
+        all_txns, recovered_cohort = generate_transactions()
+        for txn in all_txns:
             db.add(txn)
+        db.flush()  # assign ids without ending the transaction, so RecoveryEvent FKs below are valid
+
+        # Seed a real recovery-pipeline audit trail for the "already
+        # recovered" cohort, matching what recovery_service.py would have
+        # written had these gone through analyze -> execute for real.
+        # This is what makes recovered_revenue non-zero out of the box.
+        for txn in recovered_cohort:
+            action = "RETRY"
+            idempotency_key = make_idempotency_key(txn, action)
+            db.add(RecoveryEvent(
+                transaction_id=txn.id,
+                event_type="ACTION_EXECUTED",
+                action=action,
+                reason=f"{SIMULATED_TAG} Retry submitted",
+                policy_result="ALLOWED",
+                outcome="SUCCESS",
+                idempotency_key=idempotency_key,
+            ))
+            db.add(RecoveryEvent(
+                transaction_id=txn.id,
+                event_type="PAYMENT_RECOVERED",
+                action=action,
+                outcome="RECOVERED",
+                recovered_amount=txn.amount,
+            ))
 
         db.commit()
         count = db.query(Transaction).count()
-        print(f"Seeded {count} transactions and 1 default policy.")
+        recovered_total = sum(t.amount for t in recovered_cohort)
+        print(f"Seeded {count} transactions, 1 default policy, and {len(recovered_cohort)} "
+              f"recovered-pipeline events (₹{recovered_total:,.0f} recovered revenue).")
     finally:
         db.close()
 
